@@ -1,0 +1,261 @@
+-- projectile.script
+-- Снаряды игрока и ботов.
+-- Урон постепенно снижается в зависимости от времени жизни снаряда.
+-- LUA Script - precede every function and global member with lowercase
+-- of script + '_main'
+
+go.property("speed", 500)
+go.property("lifetime", 2.0)
+
+-- Начальный урон сразу после выстрела.
+go.property("damage", 50)
+
+-- Минимальный урон в конце времени жизни.
+go.property("min_damage", 1)
+
+go.property("owner_group", hash("tank"))
+go.property("owner_id", hash("/none"))
+
+
+local GROUP_WORLD = hash("world")
+local GROUP_TANK = hash("tank")
+local GROUP_BOT = hash("bot")
+
+
+--------------------------------------------------
+-- EFFECTS
+--------------------------------------------------
+
+local function spawn_impact(self, position)
+	print("[IMPACT] Spawn position: " .. tostring(position))
+
+	local ok, result = pcall(function()
+		local impact_id = factory.create(
+		"#impact_factory",
+		position,
+		vmath.quat()
+	)
+
+	print("[IMPACT] Factory created: " .. tostring(impact_id))
+
+	msg.post(impact_id, "play_effect")
+end)
+
+if not ok then
+	print("[IMPACT] FACTORY ERROR: " .. tostring(result))
+end
+end
+
+
+--------------------------------------------------
+-- RAYCAST HELPERS
+--------------------------------------------------
+
+local function get_first_hit(result)
+if type(result) == "table"
+and result.id == nil
+and result[1] ~= nil then
+	return result[1]
+end
+
+return result
+end
+
+
+--------------------------------------------------
+-- DAMAGE FALLOFF
+--------------------------------------------------
+
+local function get_current_damage(self)
+-- Защита от некорректных значений.
+local initial_damage = math.max(0, self.damage)
+
+-- Минимальный урон не должен превышать начальный.
+local minimum_damage = math.max(
+0,
+math.min(self.min_damage, initial_damage)
+)
+
+-- При некорректном lifetime используем минимальный урон.
+if self.lifetime <= 0 then
+return minimum_damage
+end
+
+-- Доля прожитого времени снаряда: от 0 до 1.
+local progress = self.elapsed / self.lifetime
+progress = math.max(0, math.min(progress, 1))
+
+-- Линейное снижение от initial_damage до minimum_damage.
+local current_damage = initial_damage
++ (minimum_damage - initial_damage) * progress
+
+-- Урон округляется до ближайшего целого числа.
+return math.max(0, math.floor(current_damage + 0.5))
+end
+
+
+--------------------------------------------------
+-- DAMAGE APPLICATION
+--------------------------------------------------
+
+local function apply_damage(self, result)
+if not result or not result.id then
+return
+end
+
+local group = result.group
+
+if group ~= GROUP_TANK and group ~= GROUP_BOT then
+return
+end
+
+-- Не наносим урон собственному GameObject.
+if result.id == self.owner_id then
+return
+end
+
+-- Снаряды игроков поражают ботов.
+-- Снаряды ботов могут поражать игроков и других ботов.
+if self.owner_group == GROUP_TANK
+and group == GROUP_TANK then
+print("[PROJECTILE] Friendly tank ignored")
+return
+end
+
+-- Рассчитываем урон на момент попадания.
+local current_damage = get_current_damage(self)
+
+print(
+"[PROJECTILE] Applying "
+.. tostring(current_damage)
+.. " damage to "
+.. tostring(result.id)
+)
+
+print(
+"[PROJECTILE] Projectile age: "
+.. string.format("%.3f", self.elapsed)
+.. " / "
+.. tostring(self.lifetime)
+)
+
+msg.post(result.id, "take_damage", {
+damage = current_damage,
+killer_id = self.owner_id,
+killer_group = self.owner_group
+})
+end
+
+
+--------------------------------------------------
+-- INIT
+--------------------------------------------------
+
+function init(self)
+self.elapsed = 0
+self.hit = false
+
+local rotation = go.get_rotation()
+
+self.direction = vmath.rotate(
+rotation,
+vmath.vector3(0, 1, 0)
+)
+
+if self.owner_group == GROUP_BOT then
+-- Боты поражают игроков и других ботов.
+self.collision_groups = {
+GROUP_WORLD,
+GROUP_TANK,
+GROUP_BOT
+}
+else
+-- Игрок поражает ботов.
+self.collision_groups = {
+GROUP_WORLD,
+GROUP_BOT
+}
+end
+
+print("[PROJECTILE] Initialized")
+print("[PROJECTILE] Initial damage: " .. tostring(self.damage))
+print("[PROJECTILE] Minimum damage: " .. tostring(self.min_damage))
+print("[PROJECTILE] Lifetime: " .. tostring(self.lifetime))
+
+if self.owner_group == GROUP_BOT then
+print("[PROJECTILE] Owner: bot")
+else
+print("[PROJECTILE] Owner: tank")
+end
+end
+
+
+--------------------------------------------------
+-- UPDATE
+--------------------------------------------------
+
+function update(self, dt)
+if self.hit then
+return
+end
+
+-- Увеличиваем возраст снаряда.
+self.elapsed = self.elapsed + dt
+
+-- Удаляем снаряд по истечении времени жизни.
+if self.elapsed >= self.lifetime then
+print("[PROJECTILE] Lifetime expired")
+go.delete()
+return
+end
+
+local from = go.get_position()
+
+local to = from + self.direction * self.speed * dt
+
+local result = physics.raycast(
+from,
+to,
+self.collision_groups
+)
+
+result = get_first_hit(result)
+
+if result then
+-- При попадании в самого стрелка продолжаем движение.
+if result.id == self.owner_id then
+go.set_position(to)
+return
+end
+
+self.hit = true
+
+print("[PROJECTILE] Hit detected")
+
+local impact_position = to
+
+if type(result) == "table" then
+for key, value in pairs(result) do
+print(
+"[PROJECTILE] Result field: "
+.. tostring(key)
+.. " = "
+.. tostring(value)
+)
+end
+
+if result.position then
+impact_position = result.position
+end
+
+apply_damage(self, result)
+end
+
+spawn_impact(self, impact_position)
+
+go.delete()
+return
+end
+
+go.set_position(to)
+end
